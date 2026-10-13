@@ -1,0 +1,30 @@
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 虚拟环境
+venv/
+env/
+.venv/
+
+# 模型权重、大文件
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+
+# 日志
+*.log
+runs/
+outputs/
+
+# IDE配置
+.vscode/
+.idea/
+*.ipynb_checkpoints
+
+# 数据集
+dataset/
+data/

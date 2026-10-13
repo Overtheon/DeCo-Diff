@@ -18,6 +18,7 @@ import logging
 import os
 import torch.nn.functional as F
 from models import UNET_models
+from gaussian_prototypes import GaussianPrototypes
 
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -189,6 +190,10 @@ def main(args):
     diffusion = create_diffusion(timestep_respacing="ddim10", predict_deviation=True, predict_xstart=False, sigma_small=False, diffusion_steps=10)
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae_type}").to(device)
     vae.eval()
+    # 方法5：加载全局高斯原型（μ/logvar/π，离线拟合后冻结）
+    proto_path = args.prototype_path or f"./prototypes/{args.dataset}_k{args.n_components}.pt"
+    prototypes = GaussianPrototypes(args.n_components).load(proto_path, device=device)
+    logger.info(f"Loaded Gaussian prototypes from {proto_path}")
     logger.info(f"Number of Parameters: {sum(p.numel() for p in model.parameters()):}")
 
 
@@ -265,10 +270,20 @@ def main(args):
             'mask': mask
             }
             
-            noise_mask = random_mask(x, mask_ratios=np.random.uniform(low=0.0, high=args.patch_shuffle_ratio, size = x.shape[0]), mask_patch_size=mask_patch_size)
-            noise = noise_mask * torch.randn_like(x, device=device) + (1-noise_mask) *  shuffle_patches(x, mask_patch_size)
-            
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, noise = noise)
+            # 方法2：噪声从原型协方差混合分布采样 N(0, d)，d = Σ_k γ_k σ²_k（逐维）
+            d = prototypes.weighted_variance(x)               # [B, C, H, W]
+            noise = torch.randn_like(x, device=device) * torch.sqrt(d + 1e-8)
+
+            # 方法4：Mahalanobis 项需要的 z_tar（加权原型均值）与 d（与上面同源）
+            z_tar = prototypes.weighted_mean(x)               # [B, C, H, W]
+            mahalanobis_kwargs = {
+                'z_tar': z_tar,
+                'd': d,
+                'eps': args.eps,
+                'lambda_weight': args.lambda_mahal,
+            }
+
+            loss_dict = diffusion.training_losses(model, x, t, model_kwargs, noise=noise, mahalanobis_kwargs=mahalanobis_kwargs)
             loss = loss_dict["loss"].mean() / accumulation_steps
             loss.backward()
             
@@ -352,6 +367,10 @@ if __name__ == "__main__":
     parser.add_argument("--augmentation", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--accumulation-steps", type=int, default=2)
     parser.add_argument("--pretrained", type=str, default='.')
+    parser.add_argument("--n-components", type=int, default=30)              # 方法5：高斯原型数量 k
+    parser.add_argument("--prototype-path", type=str, default=None)          # 不填则用 ./prototypes/{dataset}_k{k}.pt
+    parser.add_argument("--lambda-mahal", type=float, default=0.1)           # 方法4：Mahalanobis 项权重 λ
+    parser.add_argument("--eps", type=float, default=1e-3)                   # 方法4：(D+εI)⁻¹ 里的 ε
     
     args = parser.parse_args()
     if args.dataset == 'mvtec':

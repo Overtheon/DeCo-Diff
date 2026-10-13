@@ -731,7 +731,7 @@ class GaussianDiffusion:
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, mahalanobis_kwargs=None):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -803,10 +803,19 @@ class GaussianDiffusion:
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
             terms["mse"] = mean_flat((target - model_output) ** 2)
+            if mahalanobis_kwargs is not None:
+                # 方法4：z_rec = x0_pred = x_t - sqrt(1-alpha_t) * delta_theta
+                z_rec = x_t - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape) * model_output
+                z_tar = mahalanobis_kwargs["z_tar"]
+                d = mahalanobis_kwargs["d"]
+                eps = mahalanobis_kwargs.get("eps", 1e-3)
+                terms["mahal"] = mean_flat((1 - mask) * (z_rec - z_tar) ** 2 / (d + eps))
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:
                 terms["loss"] = terms["mse"]
+            if "mahal" in terms:
+                terms["loss"] = terms["loss"] + mahalanobis_kwargs["lambda_weight"] * terms["mahal"]
         else:
             raise NotImplementedError(self.loss_type)
 
@@ -895,6 +904,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        deviation_gate=None,
         eta=0.0,
     ):
         """
@@ -903,7 +913,9 @@ class GaussianDiffusion:
         """
         deviation_direction, extra = self.model_prediction(model, x, t, model_kwargs)
 
-        
+        if deviation_gate is not None:
+            # 方法1：DoD = DoD × gate（不确定性感知，逐维）
+            deviation_direction = deviation_direction * deviation_gate
 
         x0_pred = x - _extract_into_tensor(self.sqrt_one_minus_alphas_cumprod, t, x.shape) * deviation_direction
         # deviation_direction_previous =  deviation_direction - (_extract_into_tensor(self.deviatoin_coeff, t-1, x.shape) - _extract_into_tensor(self.deviatoin_coeff, t, x.shape)) * x0_pred     
@@ -926,6 +938,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        deviation_gate=None,
         device=None,
         progress=False,
         eta=0.0,
@@ -944,6 +957,7 @@ class GaussianDiffusion:
             denoised_fn=denoised_fn,
             cond_fn=cond_fn,
             model_kwargs=model_kwargs,
+            deviation_gate=deviation_gate,
             device=device,
             progress=progress,
             eta=eta,
@@ -961,6 +975,7 @@ class GaussianDiffusion:
         denoised_fn=None,
         cond_fn=None,
         model_kwargs=None,
+        deviation_gate=None,
         device=None,
         progress=False,
         eta=0.0,
@@ -1001,6 +1016,7 @@ class GaussianDiffusion:
                     denoised_fn=denoised_fn,
                     cond_fn=cond_fn,
                     model_kwargs=model_kwargs,
+                    deviation_gate=deviation_gate,
                     eta=eta,
                 )
                 yield out

@@ -3,6 +3,7 @@ from skimage.transform import resize
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from models import UNET_models
+from gaussian_prototypes import GaussianPrototypes
 import argparse
 import numpy as np
 torch.set_grad_enabled(False)
@@ -125,43 +126,72 @@ def smooth_mask(mask, sigma=1.0):
 
     
 
-def calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=256):
+def sobel_magnitude(img):
+    # img: [3, H, W] float numpy in [-1,1] -> [H, W] 梯度幅值
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    mag = np.sqrt(gx ** 2 + gy ** 2)   # [3, H, W]
+    return mag.mean(axis=0)            # [H, W]
+
+
+def calculate_anomaly_maps(x0_s, encoded_s, image_samples_s, latent_samples_s, center_size=256, alpha=0.4, beta=0.2, gamma=0.5):
     pred_geometric = []
     pred_aritmetic = []
+    pred_score = []
     image_differences = []
     latent_differences = []
     input_images = []
     output_images = []
-    for x, encoded,  image_samples, latent_samples in zip(x0_s, encoded_s,  image_samples_s, latent_samples_s):
-            
+    for x, encoded, image_samples, latent_samples in zip(x0_s, encoded_s, image_samples_s, latent_samples_s):
+
         input_image = ((np.clip(x[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
         output_image = ((np.clip(image_samples[0].detach().cpu().numpy(), -1, 1).transpose(1,2,0))*127.5+127.5).astype(np.uint8)
         input_images.append(input_image)
         output_images.append(output_image)
 
+        # 旧像素差异（保留，供 geometric/arithmetic 对比）
         image_difference = (((((torch.abs(image_samples-x))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).max(axis=2))
         image_difference = (np.clip(image_difference, 0.0, 0.4) ) * 2.5
         image_difference = smooth_mask(image_difference, sigma=3)
         image_differences.append(image_difference)
-        
+
+        # 旧隐空间差异（保留）
         latent_difference = (((((torch.abs(latent_samples-encoded))).to(torch.float32)).mean(axis=0)).detach().cpu().numpy().transpose(1,2,0).mean(axis=2))
         latent_difference = (np.clip(latent_difference, 0.0 , 0.2)) * 5
         latent_difference = smooth_mask(latent_difference, sigma=1)
         latent_difference = resize(latent_difference, (center_size, center_size))
         latent_differences.append(latent_difference)
-        
+
+        # 方法3：原始差异（未 clip/scale），用于 min() 截断
+        delta_x = torch.abs(image_samples - x).to(torch.float32).mean(axis=0).detach().cpu().numpy()  # [3,H,W]
+        delta_x = delta_x.transpose(1, 2, 0).mean(axis=2)           # [H,W]
+        delta_z = torch.abs(latent_samples - encoded).to(torch.float32).mean(axis=0).detach().cpu().numpy()  # [C,H,W]
+        delta_z = delta_z.transpose(1, 2, 0).mean(axis=2)           # [H,W] @ latent res
+        delta_z = resize(delta_z, (center_size, center_size))
+        x_np = x[0].detach().cpu().numpy()                           # [3,H,W]
+        recon_np = image_samples[0].detach().cpu().numpy()
+        delta_g = np.abs(sobel_magnitude(x_np) - sobel_magnitude(recon_np))  # [H,W]
+
+        # score = min(ΔX,α) + min(ΔZ,β) + min(ΔG,γ)
+        score = np.minimum(delta_x, alpha) + np.minimum(delta_z, beta) + np.minimum(delta_g, gamma)
+        score = smooth_mask(score, sigma=3)
+        pred_score.append(score)
+
         final_anomaly = image_difference * latent_difference
         final_anomaly = np.sqrt(final_anomaly)
         final_anomaly2 = 1/2*image_difference + 1/2*latent_difference
         pred_geometric.append(final_anomaly)
         pred_aritmetic.append(final_anomaly2)
-            
+
     pred_geometric = np.stack(pred_geometric, axis=0)
     pred_aritmetic = np.stack(pred_aritmetic, axis=0)
+    pred_score = np.stack(pred_score, axis=0)
     latent_differences = np.stack(latent_differences, axis=0)
     image_differences = np.stack(image_differences, axis=0)
 
-    return {'anomaly_geometric':pred_geometric, 'anomaly_aritmetic':pred_aritmetic, 'latent_discrepancy':latent_differences, 'image_discrepancy':image_differences}
+    return {'anomaly_geometric':pred_geometric, 'anomaly_aritmetic':pred_aritmetic,
+            'anomaly_score':pred_score,
+            'latent_discrepancy':latent_differences, 'image_discrepancy':image_differences}
 
 
 
@@ -198,6 +228,11 @@ def evaluation(args):
     model.to(device)
     print('model loaded')
 
+    # 方法5：加载全局高斯原型
+    proto_path = args.prototype_path or f"./prototypes/{args.dataset}_k{args.n_components}.pt"
+    prototypes = GaussianPrototypes(args.n_components).load(proto_path, device=device)
+    print('prototypes loaded from', proto_path)
+
 
     print('=='*30)
     print('Starting Evaluation...')
@@ -231,15 +266,18 @@ def evaluation(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 encoded = vae.encode(x.to(device)).latent_dist.mean.mul_(0.18215)
+                # 方法1：不确定性门控 gate = τ²/(d+τ²)，d 为逐维加权方差
+                d = prototypes.weighted_variance(encoded)         # [B, C, H, W]
+                gate = args.tau2 / (d + args.tau2)                # [B, C, H, W]
                 model_kwargs = {
                 'context':object_cls.to(device).unsqueeze(1),
                 'mask': None
                 }
                 latent_samples = diffusion.ddim_deviation_sample_loop(
-                    model, encoded.shape, noise = encoded, clip_denoised=False, 
+                    model, encoded.shape, noise = encoded, clip_denoised=False,
                     start_t = args.reverse_steps,
                     model_kwargs=model_kwargs, progress=False, device=device,
-                    eta = 0
+                    eta = 0, deviation_gate=gate
                 )
 
                 image_samples = vae.decode(latent_samples / 0.18215).sample 
@@ -252,7 +290,7 @@ def evaluation(args):
             x0_s += [_x0.unsqueeze(0) for _x0 in x0]
 
         print(category)        
-        anomaly_maps = calculate_anomaly_maps(x0_s, encoded_s,  image_samples_s, latent_samples_s, center_size=args.center_size)
+        anomaly_maps = calculate_anomaly_maps(x0_s, encoded_s, image_samples_s, latent_samples_s, center_size=args.center_size, alpha=args.alpha, beta=args.beta, gamma=args.gamma)
         evaluate_anomaly_maps(anomaly_maps, np.stack(segmentation_s, axis=0))
         if args.visualize:
             visualize(anomaly_maps, x0_s, image_samples_s, segmentation_s, category)
@@ -297,6 +335,12 @@ if __name__ == "__main__":
     parser.add_argument("--visualize", type=lambda v: True if v.lower() in ('yes','true','t','y','1') else False, default=True)
     parser.add_argument("--anomaly-class", type=str, default='all')
     parser.add_argument("--reverse-steps", type=int, default=5)
+    parser.add_argument("--n-components", type=int, default=30)      # 方法5：k
+    parser.add_argument("--prototype-path", type=str, default=None)  # 不填则用 ./prototypes/{dataset}_k{k}.pt
+    parser.add_argument("--tau2", type=float, default=1e-3)          # 方法1：门控极小值 τ²
+    parser.add_argument("--alpha", type=float, default=0.4)          # 方法3：min(ΔX, α)
+    parser.add_argument("--beta", type=float, default=0.2)           # 方法3：min(ΔZ, β)
+    parser.add_argument("--gamma", type=float, default=0.5)          # 方法3：min(ΔG, γ)
     
     
     args = parser.parse_args()
